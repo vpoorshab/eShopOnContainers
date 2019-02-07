@@ -13,8 +13,8 @@
     using EntityFrameworkCore;
     using Extensions.Configuration;
     using Extensions.DependencyInjection;
-    using Extensions.HealthChecks;
     using Extensions.Logging;
+    using HealthChecks.UI.Client;
     using Infrastructure;
     using Infrastructure.Filters;
     using Infrastructure.Repositories;
@@ -24,15 +24,17 @@
     using Microsoft.ApplicationInsights.Extensibility;
     using Microsoft.ApplicationInsights.ServiceFabric;
     using Microsoft.AspNetCore.Authentication.JwtBearer;
+    using Microsoft.AspNetCore.Diagnostics.HealthChecks;
+    using Microsoft.AspNetCore.Mvc;
     using Microsoft.EntityFrameworkCore.Diagnostics;
     using Microsoft.eShopOnContainers.Services.Marketing.API.Infrastructure.Middlewares;
+    using Microsoft.Extensions.Diagnostics.HealthChecks;
     using RabbitMQ.Client;
     using Swashbuckle.AspNetCore.Swagger;
     using System;
     using System.Collections.Generic;
     using System.IdentityModel.Tokens.Jwt;
     using System.Reflection;
-    using System.Threading.Tasks;
 
     public class Startup
     {
@@ -50,26 +52,18 @@
             RegisterAppInsights(services);
 
             // Add framework services.
-            services.AddMvc(options =>
-            {
-                options.Filters.Add(typeof(HttpGlobalExceptionFilter));
-            }).AddControllersAsServices();  //Injecting Controllers themselves thru DIFor further info see: http://docs.autofac.org/en/latest/integration/aspnetcore.html#controllers-as-services
+            services
+                .AddCustomHealthCheck(Configuration)
+                .AddMvc(options =>
+                {
+                    options.Filters.Add(typeof(HttpGlobalExceptionFilter));
+                })
+                .SetCompatibilityVersion(CompatibilityVersion.Version_2_2)
+                .AddControllersAsServices();  //Injecting Controllers themselves thru DIFor further info see: http://docs.autofac.org/en/latest/integration/aspnetcore.html#controllers-as-services
 
             services.Configure<MarketingSettings>(Configuration);
 
             ConfigureAuthService(services);            
-
-            services.AddHealthChecks(checks => 
-            {
-                checks.AddValueTaskCheck("HTTP Endpoint", () => new ValueTask<IHealthCheckResult>(HealthCheckResult.Healthy("Ok")));
-
-                var accountName = Configuration.GetValue<string>("AzureStorageAccountName");
-                var accountKey = Configuration.GetValue<string>("AzureStorageAccountKey");
-                if (!string.IsNullOrEmpty(accountName) && !string.IsNullOrEmpty(accountKey))
-                {
-                    checks.AddAzureBlobStorageCheck(accountName, accountKey);
-                }
-            });
 
             services.AddDbContext<MarketingContext>(options =>
             {
@@ -160,7 +154,8 @@
             services.AddCors(options =>
             {
                 options.AddPolicy("CorsPolicy",
-                    builder => builder.AllowAnyOrigin()
+                    builder => builder
+                    .SetIsOriginAllowed((host) => true)
                     .AllowAnyMethod()
                     .AllowAnyHeader()
                     .AllowCredentials());
@@ -192,8 +187,19 @@
             if (!string.IsNullOrEmpty(pathBase))
             {
                 app.UsePathBase(pathBase);
-            }    
-            
+            }
+
+            app.UseHealthChecks("/hc", new HealthCheckOptions()
+            {
+                Predicate = _ => true,
+                ResponseWriter = UIResponseWriter.WriteHealthCheckUIResponse
+            });
+
+            app.UseHealthChecks("/liveness", new HealthCheckOptions
+            {
+                Predicate = r => r.Name.Contains("self")
+            });
+
             app.UseCors("CorsPolicy");
 
             ConfigureAuth(app);
@@ -204,7 +210,8 @@
                .UseSwaggerUI(c =>
                {
                    c.SwaggerEndpoint($"{ (!string.IsNullOrEmpty(pathBase) ? pathBase : string.Empty) }/swagger/v1/swagger.json", "Marketing.API V1");
-                   c.ConfigureOAuth2("marketingswaggerui", "", "", "Marketing Swagger UI");
+                   c.OAuthClientId("marketingswaggerui");
+                   c.OAuthAppName("Marketing Swagger UI");
                });            
 
             ConfigureEventBus(app);
@@ -246,8 +253,10 @@
                 });
         }
 
-            private void RegisterEventBus(IServiceCollection services)
+        private void RegisterEventBus(IServiceCollection services)
         {
+            var subscriptionClientName = Configuration["SubscriptionClientName"];
+
             if (Configuration.GetValue<bool>("AzureServiceBusEnabled"))
             {
                 services.AddSingleton<IEventBus, EventBusServiceBus>(sp =>
@@ -255,8 +264,7 @@
                     var serviceBusPersisterConnection = sp.GetRequiredService<IServiceBusPersisterConnection>();
                     var iLifetimeScope = sp.GetRequiredService<ILifetimeScope>();
                     var logger = sp.GetRequiredService<ILogger<EventBusServiceBus>>();
-                    var eventBusSubcriptionsManager = sp.GetRequiredService<IEventBusSubscriptionsManager>();
-                    var subscriptionClientName = Configuration["SubscriptionClientName"];
+                    var eventBusSubcriptionsManager = sp.GetRequiredService<IEventBusSubscriptionsManager>();                    
 
                     return new EventBusServiceBus(serviceBusPersisterConnection, logger,
                         eventBusSubcriptionsManager, subscriptionClientName, iLifetimeScope);
@@ -277,7 +285,7 @@
                         retryCount = int.Parse(Configuration["EventBusRetryCount"]);
                     }
 
-                    return new EventBusRabbitMQ(rabbitMQPersistentConnection, logger, iLifetimeScope, eventBusSubcriptionsManager, retryCount);
+                    return new EventBusRabbitMQ(rabbitMQPersistentConnection, logger, iLifetimeScope, eventBusSubcriptionsManager, subscriptionClientName, retryCount);
                 });
             }
 
@@ -299,6 +307,57 @@
             }
 
             app.UseAuthentication();
+        }
+    }
+
+    public static class CustomExtensionMethods
+    {
+        public static IServiceCollection AddCustomHealthCheck(this IServiceCollection services, IConfiguration configuration)
+        {
+            var hcBuilder = services.AddHealthChecks();
+
+            hcBuilder.AddCheck("self", () => HealthCheckResult.Healthy());
+
+            hcBuilder
+                .AddSqlServer(
+                    configuration["ConnectionString"],
+                    name: "MarketingDB-check",
+                    tags: new string[] { "marketingdb" })
+                .AddMongoDb(
+                    configuration["MongoConnectionString"],
+                    name: "MarketingDB-mongodb-check",
+                    tags: new string[] { "mongodb" });
+
+            var accountName = configuration.GetValue<string>("AzureStorageAccountName");
+            var accountKey = configuration.GetValue<string>("AzureStorageAccountKey");
+            if (!string.IsNullOrEmpty(accountName) && !string.IsNullOrEmpty(accountKey))
+            {
+                hcBuilder
+                    .AddAzureBlobStorage(
+                        $"DefaultEndpointsProtocol=https;AccountName={accountName};AccountKey={accountKey};EndpointSuffix=core.windows.net",
+                        name: "marketing-storage-check",
+                        tags: new string[] { "marketingstorage" });
+            }
+
+            if (configuration.GetValue<bool>("AzureServiceBusEnabled"))
+            {
+                hcBuilder
+                    .AddAzureServiceBusTopic(
+                        configuration["EventBusConnection"],
+                        topicName: "eshop_event_bus",
+                        name: "marketing-servicebus-check",
+                        tags: new string[] { "servicebus" });
+            }
+            else
+            {
+                hcBuilder
+                    .AddRabbitMQ(
+                        $"amqp://{configuration["EventBusConnection"]}",
+                        name: "marketing-rabbitmqbus-check",
+                        tags: new string[] { "rabbitmqbus" });
+            }
+
+            return services;
         }
     }
 }
